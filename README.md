@@ -1,52 +1,147 @@
 # Autonomous IVR Navigation Agent
 
-#### NOTE: Live demo disabled due to third-party API costs; full architecture and implementation available in repository
+> **Demo status:** The live public demo is currently unavailable because paid API/telephony services (Twilio + model APIs) are not active right now.
 
-This project is an autonomous phone-call assistant for real-world IVR systems.
+Autonomous voice agent for navigating real-world IVR phone trees end-to-end. The system places outbound calls, ingests live telephony audio, classifies call state from ASR + VAD signals, chooses safe actions in real time (DTMF / wait / handoff / patch), and bridges the user when a human representative is reached.
 
-It places an outbound call, listens to the live menu audio, transcribes what the IVR is saying, and makes real-time decisions (DTMF, wait, handoff, patch user in, hang up). When a human representative is detected, it can generate a handoff message and bridge the user into the same call.
+## Architecture Overview
 
-Built on FastAPI + Twilio Media Streams with an explicit state machine, this repo is designed to run live telephony sessions end-to-end from a single dashboard.
+### Core modules
 
-## What It Does
+| Module | Responsibility |
+|---|---|
+| `app/main.py` | FastAPI app, HTTP/WS endpoints, session lifecycle, orchestration loop |
+| `app/agent.py` | ASR ingestion (Vosk), VAD analysis, planner call, action guardrails |
+| `app/state_machine.py` | Explicit call-state transitions + hold-time accounting |
+| `app/metrics.py` | Session KPI recording and aggregate metrics |
+| `app/telephony.py` | Twilio operations (outbound call, DTMF, hangup, TwiML builders) |
+| `app/audio.py` | Twilio mu-law decode, PCM chunking, RMS energy |
+| `app/tts.py` | Optional ElevenLabs handoff narration |
+| `app/templates/index.html` + `app/static/app.js` | Operator dashboard + live telemetry stream |
 
-- Starts and controls outbound IVR calls with Twilio.
-- Ingests streaming call audio over WebSocket.
-- Uses Vosk ASR + WebRTC VAD for live call-state classification.
-- Runs a planner loop to choose one safe action at a time.
-- Bridges user + business call legs via conference when ready.
-- Tracks session metrics (`/api/metrics`) including saved hold time and systems covered.
+### Runtime topology
+
+```text
+Dashboard UI
+  -> POST /api/start
+  -> Twilio outbound call (business leg)
+  -> /twiml/outbound response
+  -> Twilio Media Stream -> WS /ws/media
+  -> decode + ASR + VAD + state machine
+  -> planner action
+  -> Twilio execution (DTMF / patch / hangup)
+  -> live logs -> WS /ws/ui
+  -> session finalize -> metrics store
+```
+
+## Real-Time Pipeline
+
+1. **Start request**: `POST /api/start` validates payload and required config.
+2. **Session init**: shared `SESSION` object is populated under `SESSION_LOCK`.
+3. **Business leg dial**: Twilio outbound call is created with TwiML URL `/twiml/outbound`.
+4. **Media attach**: TwiML starts media streaming to `WS /ws/media` and joins conference.
+5. **Audio processing**:
+   - base64 mu-law payload -> PCM16 decode
+   - 200 ms chunking (`3200` bytes)
+   - 20 ms frames (`320` bytes) for VAD
+   - Vosk partial transcript extraction
+6. **State classification**: transcript + speech ratio + energy are fed into `CallStateMachine`.
+7. **Planning**: observation snapshot is passed to Gemini planner (or deterministic fallback).
+8. **Safe action execution**:
+   - `PRESS_DTMF` only with transcript evidence
+   - repeat-digit suppression
+   - handoff-before-patch rule
+9. **Finalize**: on stop/disconnect/hangup, state closes, KPIs are recorded, session resets.
+
+## State Machine
+
+States:
+
+- `IDLE`
+- `LISTENING`
+- `MENU`
+- `HOLD`
+- `HUMAN_DETECTED`
+- `HANDOFF_READY`
+- `PATCHING_USER`
+- `BRIDGED`
+- `FINISHED`
+- `ERROR`
+
+Transition drivers:
+
+- audio observation classification (`apply_audio_observation`)
+- planner action events (`on_action`)
+- conference bridge event (`on_user_bridged`)
+- terminal events (`finish`, `fail`)
+
+## Concurrency Model
+
+- Shared live session state is synchronized with `asyncio.Lock` (`SESSION_LOCK`).
+- Blocking SDK/API operations are offloaded with `asyncio.to_thread(...)`.
+- WebSocket ingestion, planner cadence, Twilio API calls, and UI broadcast run concurrently under real-time telephony timing constraints.
+
+## API Surface
+
+### HTTP routes
+
+- `GET /` dashboard
+- `POST /api/start` start autonomous call session
+- `POST /api/stop` stop active session
+- `GET /api/status` session/state/config snapshot
+- `GET /api/metrics` KPI summary
+- `GET /health` config readiness
+- `GET /audio/handoff.mp3` generated handoff clip
+- `POST /twiml/outbound` TwiML for business leg
+- `POST /twiml/join_user` TwiML for user leg
+
+### WebSocket routes
+
+- `WS /ws/media` Twilio media ingress
+- `WS /ws/ui` live telemetry for dashboard clients
 
 ## Project Structure
 
-```
+```text
 Caller/
 ├── .env.example
 ├── .gitignore
-├── README.md
+├── .python-version
 ├── requirements.txt
+├── README.md
 └── app/
-    ├── main.py               # API routes + orchestration loop
-    ├── agent.py              # ASR/VAD + planner + action sanitization
-    ├── state_machine.py      # explicit call state machine
-    ├── metrics.py            # KPI aggregation
-    ├── telephony.py          # Twilio helpers + TwiML builders
-    ├── tts.py                # ElevenLabs helper
-    ├── audio.py              # audio decode/chunk utils
-    ├── static/app.js         # dashboard client logic
-    ├── templates/index.html  # dashboard UI
-    └── models/               # local Vosk model files
+    ├── main.py
+    ├── agent.py
+    ├── state_machine.py
+    ├── metrics.py
+    ├── telephony.py
+    ├── tts.py
+    ├── audio.py
+    ├── static/
+    │   └── app.js
+    ├── templates/
+    │   └── index.html
+    └── models/
+        └── vosk/
 ```
 
-## Requirements
+## Configuration
 
-- Python 3.12+ (3.13 supported in code, but pin 3.12 on deploy for safest demo stability)
-- Twilio account + phone number
-- Public HTTPS URL reachable by Twilio
-- Gemini API key
-- Optional: ElevenLabs API key + voice ID
+Required environment variables:
 
-## Local Setup
+- `PUBLIC_BASE_URL`
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_FROM_NUMBER`
+- `GEMINI_API_KEY`
+
+Optional:
+
+- `ELEVENLABS_API_KEY`
+- `ELEVENLABS_VOICE_ID`
+- `VOSK_MODEL_PATH`
+
+## Local Run
 
 ```bash
 cd /Users/mustafa/Desktop/Uni/Caller
@@ -54,66 +149,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-```
-
-Fill `.env` with:
-
-- `PUBLIC_BASE_URL`
-- `TWILIO_ACCOUNT_SID`
-- `TWILIO_AUTH_TOKEN`
-- `TWILIO_FROM_NUMBER`
-- `GEMINI_API_KEY`
-- optional: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `VOSK_MODEL_PATH`
-
-## Run
-
-```bash
-cd /Users/mustafa/Desktop/Uni/Caller
 uvicorn app.main:app --reload --port 8000
 ```
 
-Open: `http://127.0.0.1:8000`
-
-## Main Endpoints
-
-- `GET /` dashboard
-- `POST /api/start` start session
-- `POST /api/stop` stop session
-- `GET /api/status` session + state snapshot
-- `GET /api/metrics` KPI summary
-- `GET /health` readiness check
-- `POST /twiml/outbound` TwiML for business leg
-- `POST /twiml/join_user` TwiML for user leg
-- `GET /audio/handoff.mp3` generated handoff audio
-- `WS /ws/ui` dashboard log stream
-- `WS /ws/media` Twilio media ingress
-
-## Deploy (Any Python Host)
-
-- Build: `pip install -r requirements.txt`
-- Start: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
-- Set `PUBLIC_BASE_URL` to your deployed HTTPS URL
-
-## Deploy On Koyeb (Free Tier)
-
-1. Push your latest code (including `.python-version`, `requirements.txt`, and app files).
-2. Create a Koyeb Web Service from this repo using **Buildpack**.
-3. In Build settings:
-- Build command override: leave empty/off.
-- Run command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1`
-4. In Environment variables, set:
-- `PUBLIC_BASE_URL=https://<your-koyeb-url>`
-- `TWILIO_ACCOUNT_SID`
-- `TWILIO_AUTH_TOKEN`
-- `TWILIO_FROM_NUMBER`
-- `GEMINI_API_KEY`
-- Optional: `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `VOSK_MODEL_PATH`
-5. In Twilio, set your voice webhook to:
-- `https://<your-koyeb-url>/voice`
-
-If deploy logs show Python 3.13 unexpectedly, verify `.python-version` is committed and pushed.
-
-## Git Safety
-
-- `.gitignore` excludes `.env`, virtualenvs, caches, logs, and key/cert files.
-- Keep `.env.example` in git; never commit `.env`.
+Open `http://127.0.0.1:8000`.
